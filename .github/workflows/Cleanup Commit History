@@ -1,0 +1,111 @@
+name: Cleanup Commit History
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_commits:
+        description: 'چند تا آخرین commit نگه داشته بشه؟'
+        required: true
+        default: '10'
+        type: string
+      dry_run:
+        description: 'پیش‌نمایش (فقط نشون بده، تغییری نده)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  clean-history:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0   # حتماً باید کل history رو بگیره
+
+      - name: Configure git bot identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Analyze and clean history
+        id: cleaner
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          N="${{ github.event.inputs.keep_commits }}"
+          DRY_RUN="${{ github.event.inputs.dry_run }}"
+
+          # ===== اعتبارسنجی ورودی =====
+          if ! [[ "$N" =~ ^[0-9]+$ ]] || [ "$N" -lt 1 ]; then
+            echo "❌ خطا: مقدار keep_commits باید یک عدد مثبت باشد."
+            exit 1
+          fi
+
+          TOTAL=$(git rev-list --count HEAD)
+          echo "📊 تعداد کل commit‌ها روی main: $TOTAL"
+          echo "🎯 تعداد commit‌هایی که نگه داشته می‌شن: $N"
+          echo "-------------------------------------------"
+
+          # ===== اگه commit کافی نبود =====
+          if [ "$TOTAL" -le "$N" ]; then
+            echo "✅ تعداد commit‌ها ($TOTAL) کمتر یا مساوی $N است. نیازی به cleanup نیست."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          TO_DELETE=$(( TOTAL - N ))
+          echo "🗑️  تعداد commit‌هایی که حذف می‌شن: $TO_DELETE"
+          echo ""
+
+          # ===== نشون دادن commit‌هایی که نگه می‌مونن =====
+          echo "✅ commit‌هایی که نگه داشته می‌شن (آخرین $N تا):"
+          git log --oneline -"$N" | nl -w3 -s'. '
+          echo ""
+
+          # ===== نشون دادن commit‌هایی که حذف می‌شن =====
+          echo "🗑️  commit‌هایی که حذف می‌شن ($TO_DELETE تا قدیمی‌تر):"
+          git log --oneline --skip="$N" | nl -w3 -s'. '
+          echo ""
+          echo "-------------------------------------------"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "🔎 [DRY RUN] هیچ تغییری اعمال نشد."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ===== ساختن root commit جدید (یتیم) =====
+          # درخت فایل‌ها رو از commit ای که درست قبل از پنجره ما هست می‌گیریم
+          TREE=$(git rev-parse "HEAD~${N}^{tree}")
+
+          NEW_ROOT=$(git commit-tree "$TREE" \
+            -m "chore: squashed history — kept last $N commits [automated cleanup]")
+
+          echo "🔨 root commit جدید ساخته شد: $NEW_ROOT"
+
+          # ===== N تا commit آخر رو روی root جدید rebase می‌کنیم =====
+          git rebase --onto "$NEW_ROOT" "HEAD~${N}" HEAD
+
+          echo "✅ rebase با موفقیت انجام شد."
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+
+      - name: Force push to main
+        if: steps.cleaner.outputs.skipped == 'false'
+        run: |
+          git push origin HEAD:main --force
+          echo ""
+          echo "🚀 history با موفقیت روی main به‌روز شد."
+          echo ""
+          echo "📊 وضعیت نهایی:"
+          FINAL=$(git rev-list --count HEAD)
+          echo "   تعداد commit‌های باقی‌مانده: $FINAL"
+          git log --oneline | nl -w3 -s'. '
